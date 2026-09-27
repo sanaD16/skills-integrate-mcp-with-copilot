@@ -5,14 +5,84 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
+import secrets
+import time
 from pathlib import Path
+from teacher_auth import verify_password
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+SESSION_COOKIE = "teacher_session"
+SESSION_TTL = 8 * 60 * 60
+sessions: dict[str, tuple[str, float]] = {}
+
+
+class LoginCredentials(BaseModel):
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=256)
+
+
+def get_session_teacher(request: Request) -> str | None:
+    token = request.cookies.get(SESSION_COOKIE)
+    session = sessions.get(token) if token else None
+    if session is None:
+        return None
+
+    username, expires_at = session
+    if expires_at <= time.time():
+        sessions.pop(token, None)
+        return None
+    return username
+
+
+def require_teacher(request: Request) -> None:
+    if get_session_teacher(request) is None:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+
+
+@app.post("/login")
+def login(credentials: LoginCredentials, request: Request, response: Response):
+    if not verify_password(credentials.username, credentials.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(32)
+    sessions[token] = (credentials.username, time.time() + SESSION_TTL)
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_TTL,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Logged in"}
+
+
+@app.post("/logout")
+def logout(request: Request, response: Response):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        sessions.pop(token, None)
+    response.delete_cookie(
+        SESSION_COOKIE,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Logged out"}
+
+
+@app.get("/auth/status")
+def auth_status(request: Request):
+    return {"authenticated": get_session_teacher(request) is not None}
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,7 +158,7 @@ def get_activities():
     return activities
 
 
-@app.post("/activities/{activity_name}/signup")
+@app.post("/activities/{activity_name}/signup", dependencies=[Depends(require_teacher)])
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
@@ -110,7 +180,7 @@ def signup_for_activity(activity_name: str, email: str):
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
-@app.delete("/activities/{activity_name}/unregister")
+@app.delete("/activities/{activity_name}/unregister", dependencies=[Depends(require_teacher)])
 def unregister_from_activity(activity_name: str, email: str):
     """Unregister a student from an activity"""
     # Validate activity exists
